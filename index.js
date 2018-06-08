@@ -26,7 +26,7 @@ var controls = new THREE.OrbitControls(camera, renderer.domElement);
 
 const matNormal = new THREE.MeshNormalMaterial();
 
-const floorGeo = new THREE.PlaneBufferGeometry(2.0, 2.0);
+const floorGeo = new THREE.PlaneBufferGeometry(3.0, 3.0);
 const floor = new THREE.Mesh(floorGeo, matNormal);
 floor.position.set(0, -0.5, 0);
 floor.rotation.x = -((Math.PI * 90)/180);
@@ -37,8 +37,15 @@ const sphere = new THREE.Mesh(sphereGeo, matNormal);
 sphere.castShadow = true;
 sphere.receiveShadow = true;
 
+const coneGeo = new THREE.ConeGeometry(0.3, 1, 32);
+const cone = new THREE.Mesh(coneGeo, matNormal);
+cone.position.set(-1.0, 0, 0);
+cone.castShadow = true;
+cone.receiveShadow = true;
+
 scene.add(floor);
 scene.add(sphere);
+scene.add(cone);
 scene.add(camera);
 
 const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
@@ -51,17 +58,27 @@ directionalLight.shadow.bias = -0.0001;
 
 scene.add(directionalLight);
 
+// The pink part is missing since the shader in Shadertoy secretly renders shadows
+// to an alpha channel that wasn;t visible in the first place as we can see in the
+// picture.
+// We used the forward one by adding a material that holds the shadows. These must be 
+// handled in an additional render pass. 
+// A MeshPhonMaterial can hold shadows. While a new render target saves them. 
+// Again, a sesize function is needed. 
 const matShadow = new THREE.MeshPhongMaterial({
     color: 0xffffff,
     shininess: 0.0
 })
 
 const PARAMS = {
-    miniFilter: THREE.LinearFilter,
+    minFilter: THREE.LinearFilter,
     magFilter: THREE.LinearFilter,
     format: THREE.RGBFormat,
     stencilBuffer: false
 }
+// A render target is a buffer where the video card draws pixels for a scene that
+// is being rendered in the background. it is used in different effects, such as 
+// applying postprcessing to a rendered image before displaying on the screen. 
 
 const shadowBuffer = new THREE.WebGLRenderTarget(1, 1, PARAMS);
 shadowBuffer.setSize(width, height);
@@ -70,7 +87,7 @@ window.addEventListener('resize', onWindowResize, false);
 
 const VERTEX = `
     varying vec2 vUv;
-    
+
     void main() {
         vUv = uv;
         vec4 mvPosition = modelViewMatrix * vec4(position, 1.);
@@ -78,9 +95,12 @@ const VERTEX = `
     }
 `;
 
+// The shader definition also defines a Unifrom called tDiffuse used by
+// the EffectComposer. It contains the image from the previous rendering
+// pass that will be altered in the current pass. 
 const FRAGMENT = `
     varying vec2 vUv;
-    
+
     uniform sampler2D tDiffuse;
     uniform sampler2D tShadow;
     uniform vec2 iResolution;
@@ -112,7 +132,6 @@ const FRAGMENT = `
         gl_FragColor = vec4(edge, shadow, 1.0, 1.0);
     }
 `;
-
 
 const FRAGMENT_FINAL = `
     uniform sampler2D tDiffuse;
@@ -155,6 +174,31 @@ const FRAGMENT_FINAL = `
     }
 `;
 
+const VIGNETTE =  `
+   varying vec2 vUv;
+
+   uniform sampler2D tDiffuse;
+
+   #define Radius 0.75
+   #define Softness 0.45
+   #define Sepia vec3(1.2, 1.0, 0.8)
+
+   // Reference: https://github.com/mattdesl/lwjgl-basics/wiki/ShaderLesson3
+   void main()
+   {
+       vec2 uv = vUv;
+       vec2 center = uv - vec2(0.5);
+       float len = length(center);
+       float vignette = smoothstep(Radius, Radius - Softness, len);
+       vec4 texColor = texture2D(tDiffuse, uv);
+       texColor.rgb = mix(texColor.rgb, texColor.rgb * vignette, 0.5);
+       float gray = dot(texColor.rgb, vec3(0.299, 0.687, 0.114));
+       vec3 sepiaColor = vec3(gray) * Sepia;
+       texColor.rgb = mix(texColor.rgb, sepiaColor, 0.75);
+       gl_FragColor = texColor;
+   }
+`;
+
 const resolution = new THREE.Vector2(width, height);
 
 const drawShader = {
@@ -167,14 +211,27 @@ const drawShader = {
     fragmentShader: FRAGMENT
 };
 
+// This creates an EffectComposer Instance which adds a normal rendering pass
+// and an additional shader pass. 
 const composer = new THREE.EffectComposer(renderer);
 composer.addPass(new THREE.RenderPass(scene, camera));
 
+// in this example, shading is completed by postprocessing
 const pass = new THREE.ShaderPass(drawShader);
-// pass.renderToScreen = true;
 composer.addPass(pass);
 
 const clock = new THREE.Clock();
+
+const vignetteShader = {
+    uniforms: {
+        tDiffuse: { type: 't', value: null}
+    },
+    vertexShader: VERTEX,
+    fragmentShader: VIGNETTE
+};
+
+const passVignette = new THREE.ShaderPass(vignetteShader);
+passVignette.renderToScreen = true;
 
 const finalShader = {
     uniforms: {
@@ -187,9 +244,11 @@ const finalShader = {
 };
 
 const passFinal = new THREE.ShaderPass(finalShader);
-passFinal.renderToScreen = true;
+// passFinal.renderToScreen = true;
 passFinal.material.extensions.derivatives = true;
 composer.addPass(passFinal);
+composer.addPass(passVignette);
+
 
 function onWindowResize() {
     width = window.innerWidth;
@@ -201,7 +260,10 @@ function onWindowResize() {
     shadowBuffer.setSize(width, height);
     composer.setSize(width, height); 
     renderer.setSize(width, height);
-    pass.uniforms.iResolution.value.set(width, height)
+    // It is important that we use the uniforms of the actual render pass. 
+    // The original one has been deeply cloned by the EffectComposer; 
+    // changing the variable resolution would have no effect.
+    pass.uniforms.iResolution.value.set(width, height); 
 }
 
 function loop() {
@@ -210,19 +272,23 @@ function loop() {
     render();
 }
 
+// Now we can transfer the shadows to the new render target 
+// and prepare it for the shader 
 function render() {
     floor.material = matShadow;
     sphere.material = matShadow;
     renderer.render(scene, camera, shadowBuffer);
+    // set shadow to a uniform
     pass.uniforms.tShadow.value = shadowBuffer.texture;
 
     // change the material back to MashNormalMaterial
     floor.material = matNormal;
     sphere.material = matNormal;
     
-    // renderer.render(scene, camera);
+    const elapsed = clock.getElapsedTime();
+    passFinal.uniforms.iTime.value = elapsed;
+    
     composer.render();
-    // we show this pass rather than the original scene. 
 }
 
 render();
